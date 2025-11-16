@@ -1506,7 +1506,7 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 			pages[i] = alloc_frag->page;
 			get_page(pages[i]);
 			char *fragment_start = (char *)page_address(pages[i]) + alloc_frag->offset;
-			char *buf = fragment_start + headroom;
+			buf = fragment_start + headroom;
 			alloc_frag->offset += len + room;
 			hole = alloc_frag->size - alloc_frag->offset;
 			if (hole < len + room) {
@@ -1521,7 +1521,7 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 				goto cleanup;
 			}
 
-			struct fands_iova_info *fands_ctx = (struct fands_iova_info *)fragment_start;
+			fands_ctx = (struct fands_iova_info *)fragment_start;
 
 			fands_ctx->is_fands = true;
 			fands_ctx->iova_base = iova_base;
