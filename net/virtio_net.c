@@ -958,8 +958,21 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 					 unsigned int *xdp_xmit,
 					 struct virtnet_rq_stats *stats)
 {
-	struct fands_iova_info *fands_ctx = (struct fands_iova_info *)ctx;
-	if (fands_ctx && fands_ctx->is_fands) {
+	//struct fands_iova_info *fands_ctx = (struct fands_iova_info *)ctx;
+	//if (fands_ctx && fands_ctx->is_fands) {
+	//	struct device *pdev = &vi->vdev->dev;
+	//	dma_addr_t iova = fands_ctx->iova_base + (fands_ctx->batch_idx * PAGE_SIZE);
+	//	bool last_buf = (fands_ctx->batch_idx == fands_ctx->batch_size - 1);
+	//	unsigned long iova_alloc_size = PAGE_SIZE * fands_ctx->batch_size;
+
+	//	iommu_dma_unmap_page_iova(pdev, iova, PAGE_SIZE, iova_alloc_size, last_buf, DMA_FROM_DEVICE, 0);
+
+	//	ctx = fands_ctx->orig_ctx;
+	//	kfree(fands_ctx);
+	//}
+	
+	if ((unsigned long)ctx & 1UL) {
+		struct fands_iova_info *fands_ctx = (void *)((unsigned long)ctx & ~1UL);
 		struct device *pdev = &vi->vdev->dev;
 		dma_addr_t iova = fands_ctx->iova_base + (fands_ctx->batch_idx * PAGE_SIZE);
 		bool last_buf = (fands_ctx->batch_idx == fands_ctx->batch_size - 1);
@@ -1525,7 +1538,9 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 			sg_init_one(rq->sg, buf, len);
 			iova_array[0] = iovas[i];
 			
-			ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, fands_ctx, gfp);
+			void *ctx_with_tag = (void *)((unsigned long)fands_ctx | 1UL);
+			ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, ctx_with_tag, gfp);
+			// ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, fands_ctx, gfp);
 			if (ret < 0) {
 				kfree(fands_ctx);
 				iommu_dma_unmap_page_iova(dev, iovas[i], PAGE_SIZE, 0, false, DMA_FROM_DEVICE, 0);
