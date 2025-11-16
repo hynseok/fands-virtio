@@ -30,6 +30,7 @@ extern int virtqueue_add_inbuf_iova(struct virtqueue *vq,
 			struct scatterlist *sg, unsigned int num,
 			dma_addr_t *iovas,
 			void *data,
+			void *ctx,
 			gfp_t gfp);
 
 static int napi_weight = NAPI_POLL_WEIGHT;
@@ -981,7 +982,6 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 		iommu_dma_unmap_page_iova(pdev, iova, PAGE_SIZE, iova_alloc_size, last_buf, DMA_FROM_DEVICE, 0);
 
 		ctx = fands_ctx->orig_ctx;
-		kfree(fands_ctx);
 	}
 
 	struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
@@ -1505,8 +1505,8 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 
 			pages[i] = alloc_frag->page;
 			get_page(pages[i]);
-			buf = (char *)page_address(pages[i]) + alloc_frag->offset;
-			buf += headroom;
+			char *fragment_start = (char *)page_address(pages[i]) + alloc_frag->offset;
+			char *buf = fragment_start + headroom;
 			alloc_frag->offset += len + room;
 			hole = alloc_frag->size - alloc_frag->offset;
 			if (hole < len + room) {
@@ -1521,28 +1521,20 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 				goto cleanup;
 			}
 
-			fands_ctx = kmalloc(sizeof(*fands_ctx), gfp);
-			if (!fands_ctx) {
-				iommu_dma_unmap_page_iova(dev, iovas[i], PAGE_SIZE, 0, false, DMA_FROM_DEVICE, 0);
-				put_page(pages[i]);
-				ret = -ENOMEM;
-				goto cleanup;
-			}
+			struct fands_iova_info *fands_ctx = (struct fands_iova_info *)fragment_start;
 
 			fands_ctx->is_fands = true;
 			fands_ctx->iova_base = iova_base;
 			fands_ctx->batch_idx = i;
 			fands_ctx->batch_size = VIRTIO_NET_FANDS_BATCH_SIZE;
 			fands_ctx->orig_ctx = mergeable_len_to_ctx(len, headroom);
-
-			sg_init_one(rq->sg, buf, len);
-			iova_array[0] = iovas[i];
 			
+			sg_init_one(rq->sg, buf, len); // sg는 'buf' (데이터 포인터)를 가리킴
+			iova_array[0] = iovas[i];
+
 			void *ctx_with_tag = (void *)((unsigned long)fands_ctx | 1UL);
-			ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, ctx_with_tag, gfp);
-			// ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, fands_ctx, gfp);
+			ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, buf, ctx_with_tag, gfp);
 			if (ret < 0) {
-				kfree(fands_ctx);
 				iommu_dma_unmap_page_iova(dev, iovas[i], PAGE_SIZE, 0, false, DMA_FROM_DEVICE, 0);
 				put_page(pages[i]);
 				goto cleanup;

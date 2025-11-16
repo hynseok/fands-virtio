@@ -2213,7 +2213,7 @@ static int virtqueue_add_split_iova(struct virtqueue *_vq,
 	START_USE(vq);
 
 	BUG_ON(data == NULL);
-	BUG_ON(ctx != NULL); // F&S path doesn't use context for indirect descriptors
+	// BUG_ON(ctx != NULL);
 
 	if (unlikely(vq->broken)) {
 		END_USE(vq);
@@ -2267,7 +2267,7 @@ static int virtqueue_add_split_iova(struct virtqueue *_vq,
 	vq->vq.num_free -= descs_used;
 	vq->free_head = i;
 	vq->split.desc_state[head].data = data;
-	vq->split.desc_state[head].indir_desc = NULL; // No indirect support for F&S path
+	vq->split.desc_state[head].indir_desc = ctx;
 
 	avail = vq->split.avail_idx_shadow & (vq->split.vring.num - 1);
 	vq->split.vring.avail->ring[avail] = cpu_to_virtio16(_vq->vdev, head);
@@ -2327,9 +2327,10 @@ int virtqueue_add_inbuf_iova(struct virtqueue *vq,
 			struct scatterlist *sg, unsigned int num,
 			dma_addr_t *iovas,
 			void *data,
+			void *ctx,
 			gfp_t gfp)
 {
-	return virtqueue_add_iova(vq, &sg, num, 0, 1, iovas, data, NULL, gfp);
+	return virtqueue_add_iova(vq, &sg, num, 0, 1, iovas, data, ctx, gfp);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_iova);
 
