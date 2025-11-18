@@ -738,8 +738,9 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 {
 	unsigned int i, j;
 	__virtio16 nextflag = cpu_to_virtio16(vq->vq.vdev, VRING_DESC_F_NEXT);
-
+	
 	bool premapped = vq->split.desc_state[head].premapped;
+	
 	/* Clear data ptr. */
 	vq->split.desc_state[head].data = NULL;
 

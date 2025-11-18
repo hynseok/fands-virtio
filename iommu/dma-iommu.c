@@ -719,8 +719,6 @@ static void __iommu_dma_unmap_iova(struct device *dev, dma_addr_t dma_addr,
 	
 	if (free_iova) {
 		iommu_iotlb_sync(domain, &iotlb_gather);
-	} else if (!iotlb_gather.queued) {
-		iommu_iotlb_sync(domain, &iotlb_gather);
 	}
 
 	if (free_iova) {
