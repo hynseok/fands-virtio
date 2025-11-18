@@ -69,6 +69,7 @@
 struct vring_desc_state_split {
 	void *data;			/* Data for callback. */
 	struct vring_desc *indir_desc;	/* Indirect descriptor, if any. */
+	bool premapped;
 };
 
 struct vring_desc_state_packed {
@@ -646,6 +647,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 
 	/* Store token and indirect buffer state. */
 	vq->split.desc_state[head].data = data;
+
+	vq->split.desc_state[head].premapped = false;
 	if (indirect)
 		vq->split.desc_state[head].indir_desc = desc;
 	else
@@ -736,6 +739,7 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 	unsigned int i, j;
 	__virtio16 nextflag = cpu_to_virtio16(vq->vq.vdev, VRING_DESC_F_NEXT);
 
+	bool premapped = vq->split.desc_state[head].premapped;
 	/* Clear data ptr. */
 	vq->split.desc_state[head].data = NULL;
 
@@ -743,12 +747,15 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 	i = head;
 
 	while (vq->split.vring.desc[i].flags & nextflag) {
-		vring_unmap_one_split(vq, i);
-		i = vq->split.desc_extra[i].next;
-		vq->vq.num_free++;
+		if (!premapped) {
+			vring_unmap_one_split(vq, i);
+			i = vq->split.desc_extra[i].next;
+			vq->vq.num_free++;
+		}	
 	}
 
-	vring_unmap_one_split(vq, i);
+	if(!premapped)
+		vring_unmap_one_split(vq, i);
 	vq->split.desc_extra[i].next = vq->free_head;
 	vq->free_head = head;
 
@@ -769,9 +776,11 @@ static void detach_buf_split(struct vring_virtqueue *vq, unsigned int head,
 		BUG_ON(!(vq->split.desc_extra[head].flags &
 				VRING_DESC_F_INDIRECT));
 		BUG_ON(len == 0 || len % sizeof(struct vring_desc));
-
-		for (j = 0; j < len / sizeof(struct vring_desc); j++)
-			vring_unmap_one_split_indirect(vq, &indir_desc[j]);
+		
+		if (!premapped) {
+			for (j = 0; j < len / sizeof(struct vring_desc); j++)
+				vring_unmap_one_split_indirect(vq, &indir_desc[j]);
+		}
 
 		kfree(indir_desc);
 		vq->split.desc_state[head].indir_desc = NULL;
@@ -2298,6 +2307,7 @@ static int virtqueue_add_split_iova(struct virtqueue *_vq,
 	vq->free_head = i;
 	vq->split.desc_state[head].data = data;
 	vq->split.desc_state[head].indir_desc = ctx;
+	vq->split.desc_state[head].premapped = true;
 
 	avail = vq->split.avail_idx_shadow & (vq->split.vring.num - 1);
 	vq->split.vring.avail->ring[avail] = cpu_to_virtio16(_vq->vdev, head);
