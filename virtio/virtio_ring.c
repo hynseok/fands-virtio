@@ -222,6 +222,16 @@ static struct virtqueue *__vring_new_virtqueue(unsigned int index,
 static struct vring_desc_extra *vring_alloc_desc_extra(unsigned int num);
 static void vring_free(struct virtqueue *_vq);
 
+static int virtqueue_add_split_iova(struct virtqueue *_vq,
+				      struct scatterlist *sgs[],
+				      unsigned int total_sg,
+				      unsigned int out_sgs,
+				      unsigned int in_sgs,
+				      dma_addr_t *iovas,
+				      void *data,
+				      void *ctx,
+				      gfp_t gfp);
+
 /*
  * Helpers.
  */
