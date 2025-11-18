@@ -1003,7 +1003,7 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 	
 	if ((unsigned long)ctx & 1UL) {
 		struct fands_iova_info *fands_ctx = (void *)((unsigned long)ctx & ~1UL);
-		struct device *pdev = &vi->vdev->dev;
+		struct device *pdev = vi->vdev->dev.parent;
 		dma_addr_t iova = fands_ctx->iova_base + (fands_ctx->batch_idx * PAGE_SIZE);
 		bool last_buf = (fands_ctx->batch_idx == fands_ctx->batch_size - 1);
 		unsigned long iova_alloc_size = PAGE_SIZE * fands_ctx->batch_size;
@@ -1468,7 +1468,7 @@ static unsigned int get_mergeable_buf_len(struct receive_queue *rq,
 static int add_recvbuf_mergeable(struct virtnet_info *vi,
 				 struct receive_queue *rq, gfp_t gfp)
 {
-	struct device *dev = &vi->vdev->dev;
+	struct device *dev = vi->vdev->dev.parent;
 
 	if (!device_iommu_mapped(dev)) {
 		// Original path if no IOMMU
@@ -1747,7 +1747,7 @@ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
 	void *ptr;
 
 	struct virtnet_info *vi = sq->vq->vdev->priv;
-	bool iommu_on = device_iommu_mapped(&vi->vdev->dev);
+	bool iommu_on = device_iommu_mapped(vi->vdev->dev.parent);
 	dma_addr_t batch_start = 0;
 	size_t batch_len = 0;
 
@@ -1766,7 +1766,7 @@ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
 					batch_len += cb->total_len;
 				} else {
 					if (batch_len > 0) {
-						iommu_dma_unmap_page_iova(&vi->vdev->dev, batch_start, batch_len, 
+						iommu_dma_unmap_page_iova(vi->vdev->dev.parent, batch_start, batch_len, 
 									  0, false, DMA_TO_DEVICE, 0);
 					}
 					batch_start = cb->iova_start;
@@ -1785,7 +1785,7 @@ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
 	}
 
 	if (iommu_on && batch_len > 0) {
-		iommu_dma_unmap_page_iova(&vi->vdev->dev, batch_start, batch_len, 
+		iommu_dma_unmap_page_iova(vi->vdev->dev.parent, batch_start, batch_len, 
 					  0, false, DMA_TO_DEVICE, 0);
 	}
 
@@ -2007,7 +2007,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 	bool use_napi = sq->napi.weight;
 
 	// F&S IOVA
-	if (device_iommu_mapped(&vi->vdev->dev)) {
+	if (device_iommu_mapped(vi->vdev->dev.parent)) {
 		dma_addr_t iova_start;
 		dma_addr_t curr_iova;
 		dma_addr_t iova_list[MAX_SKB_FRAGS + 2];
@@ -2057,7 +2057,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 			unsigned int off = offset_in_page(skb->data);
 			unsigned int len = skb_headlen(skb);
 			
-			iommu_dma_map_page_iova(&vi->vdev->dev, p, curr_iova, 
+			iommu_dma_map_page_iova(vi->vdev->dev.parent, p, curr_iova, 
                                     true /* first */, off, len, DMA_TO_DEVICE, 0);
 			
       sg_set_page(&sq->sg[sg_idx], p, len, off);
@@ -2069,7 +2069,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 			__skb_pull(skb, hdr_len); 
 		} else {
 			struct page *p = virt_to_page(hdr);
-			iommu_dma_map_page_iova(&vi->vdev->dev, p, curr_iova, 
+			iommu_dma_map_page_iova(vi->vdev->dev.parent, p, curr_iova, 
                                     true /* first */, offset_in_page(hdr), hdr_len, DMA_TO_DEVICE, 0);
 			
       sg_set_buf(&sq->sg[sg_idx], hdr, hdr_len);
@@ -2081,7 +2081,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
       if (skb_headlen(skb)) {
           p = virt_to_page(skb->data);
           unsigned int len = skb_headlen(skb);
-          iommu_dma_map_page_iova(&vi->vdev->dev, p, curr_iova, 
+          iommu_dma_map_page_iova(vi->vdev->dev.parent, p, curr_iova, 
                                   false, offset_in_page(skb->data), len, DMA_TO_DEVICE, 0);
           sg_set_page(&sq->sg[sg_idx], p, len, offset_in_page(skb->data));
           sq->sg[sg_idx].dma_address = curr_iova;
@@ -2095,7 +2095,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 			unsigned int len = skb_frag_size(frag);
 			
-			iommu_dma_map_page_iova(&vi->vdev->dev, skb_frag_page(frag), curr_iova,
+			iommu_dma_map_page_iova(vi->vdev->dev.parent, skb_frag_page(frag), curr_iova,
 						false, skb_frag_off(frag), len, DMA_TO_DEVICE, 0);
 			
 			sg_set_page(&sq->sg[sg_idx], skb_frag_page(frag), len, skb_frag_off(frag));
@@ -2114,7 +2114,7 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 		err = virtqueue_add_outbuf_iova(sq->vq, sq->sg, num_sg, iova_list, skb, GFP_ATOMIC);
 		
 		if (unlikely(err)) {
-      iommu_dma_unmap_page_iova(&vi->vdev->dev, iova_start, alloc_size, 
+      iommu_dma_unmap_page_iova(vi->vdev->dev.parent, iova_start, alloc_size, 
                                       0, false, DMA_TO_DEVICE, 0);
             
       sq->fands_offset -= alloc_size; 
@@ -2298,7 +2298,7 @@ static bool virtnet_send_command(struct virtnet_info *vi, u8 class, u8 cmd,
 	BUG_ON(out_num + 1 > ARRAY_SIZE(sgs));
 	ret = virtqueue_add_sgs(vi->cvq, sgs, out_num, 1, vi, GFP_ATOMIC);
 	if (ret < 0) {
-		dev_warn(&vi->vdev->dev,
+		dev_warn(vi->vdev->dev.parent,
 			 "Failed to add sgs for command vq: %d\n.", ret);
 		return false;
 	}
@@ -3635,7 +3635,7 @@ static void virtnet_free_queues(struct virtnet_info *vi)
 		__netif_napi_del(&vi->sq[i].napi);
 
 		if (vi->sq[i].fands_base) {
-      iommu_dma_unmap_page_iova(&vi->vdev->dev, vi->sq[i].fands_base, 
+      iommu_dma_unmap_page_iova(vi->vdev->dev.parent, vi->sq[i].fands_base, 
                                FANDS_TX_POOL_SIZE, FANDS_TX_POOL_SIZE, 
                                true, DMA_TO_DEVICE, 0);
       vi->sq[i].fands_base = 0;
@@ -3867,16 +3867,16 @@ static int virtnet_alloc_queues(struct virtnet_info *vi)
 		u64_stats_init(&vi->rq[i].stats.syncp);
 		u64_stats_init(&vi->sq[i].stats.syncp);
 
-		if (device_iommu_mapped(&vi->vdev->dev)) {
+		if (device_iommu_mapped(vi->vdev->dev.parent)) {
       vi->sq[i].fands_base = iommu_dma_alloc_iova(
-          iommu_get_dma_domain(&vi->vdev->dev),
+          iommu_get_dma_domain(vi->vdev->dev.parent),
           FANDS_TX_POOL_SIZE, 
-          dma_get_mask(&vi->vdev->dev), 
-          &vi->vdev->dev
+          dma_get_mask(vi->vdev->dev.parent), 
+          vi->vdev->dev.parent
       );
       vi->sq[i].fands_offset = 0;
       if (!vi->sq[i].fands_base) {
-        dev_err(&vi->vdev->dev, "Failed to alloc F&S TX pool for queue %d\n", i);
+        dev_err(vi->vdev->dev.parent, "Failed to alloc F&S TX pool for queue %d\n", i);
 				goto err_fands;
       }
     }
@@ -3887,7 +3887,7 @@ static int virtnet_alloc_queues(struct virtnet_info *vi)
 err_fands:
   while (--i >= 0) {
     if (vi->sq[i].fands_base) {
-      iommu_dma_unmap_page_iova(&vi->vdev->dev, vi->sq[i].fands_base, 
+      iommu_dma_unmap_page_iova(vi->vdev->dev.parent, vi->sq[i].fands_base, 
                                   FANDS_TX_POOL_SIZE, FANDS_TX_POOL_SIZE, 
                                   true, DMA_TO_DEVICE, 0);
     }
