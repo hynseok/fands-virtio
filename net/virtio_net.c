@@ -961,7 +961,7 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 {
 	//struct fands_iova_info *fands_ctx = (struct fands_iova_info *)ctx;
 	//if (fands_ctx && fands_ctx->is_fands) {
-	//	struct device *pdev = &vi->vdev->dev;
+	//	struct device *pdev = vi->vdev->dev.parent;
 	//	dma_addr_t iova = fands_ctx->iova_base + (fands_ctx->batch_idx * PAGE_SIZE);
 	//	bool last_buf = (fands_ctx->batch_idx == fands_ctx->batch_size - 1);
 	//	unsigned long iova_alloc_size = PAGE_SIZE * fands_ctx->batch_size;
@@ -974,7 +974,7 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 	
 	if ((unsigned long)ctx & 1UL) {
 		struct fands_iova_info *fands_ctx = (void *)((unsigned long)ctx & ~1UL);
-		struct device *pdev = &vi->vdev->dev;
+		struct device *pdev = vi->vdev->dev.parent;
 		dma_addr_t iova = fands_ctx->iova_base + (fands_ctx->batch_idx * PAGE_SIZE);
 		bool last_buf = (fands_ctx->batch_idx == fands_ctx->batch_size - 1);
 		unsigned long iova_alloc_size = PAGE_SIZE * fands_ctx->batch_size;
@@ -1439,7 +1439,7 @@ static unsigned int get_mergeable_buf_len(struct receive_queue *rq,
 static int add_recvbuf_mergeable(struct virtnet_info *vi,
 				 struct receive_queue *rq, gfp_t gfp)
 {
-	struct device *dev = &vi->vdev->dev;
+	struct device *dev = vi->vdev->dev.parent;
 
 	if (!device_iommu_mapped(dev)) {
 		// Original path if no IOMMU
@@ -2115,7 +2115,7 @@ static bool virtnet_send_command(struct virtnet_info *vi, u8 class, u8 cmd,
 	BUG_ON(out_num + 1 > ARRAY_SIZE(sgs));
 	ret = virtqueue_add_sgs(vi->cvq, sgs, out_num, 1, vi, GFP_ATOMIC);
 	if (ret < 0) {
-		dev_warn(&vi->vdev->dev,
+		dev_warn(vi->vdev->dev.parent,
 			 "Failed to add sgs for command vq: %d\n.", ret);
 		return false;
 	}
