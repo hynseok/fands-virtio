@@ -33,6 +33,12 @@ extern int virtqueue_add_inbuf_iova(struct virtqueue *vq,
 			void *ctx,
 			gfp_t gfp);
 
+extern int virtqueue_add_outbuf_iova(struct virtqueue *vq,
+			struct scatterlist *sg, unsigned int num,
+			dma_addr_t *iovas, 
+			void *data, 
+			gfp_t gfp);
+
 static int napi_weight = NAPI_POLL_WEIGHT;
 module_param(napi_weight, int, 0444);
 
@@ -43,6 +49,22 @@ struct fands_iova_info {
 	u16 batch_size;
 	void *orig_ctx;
 };
+
+#define FANDS_TX_POOL_SIZE (256 * 1024 * 1024) // 256MB
+#define FANDS_METADATA_SIZE sizeof(struct fands_iova_info)
+#define VIRTIO_NET_FANDS_BATCH_SIZE 64
+
+struct fands_tx_topology {
+    dma_addr_t iova_base;
+    u64 total_size;
+    atomic64_t cursor; /* current allocation offset */
+};
+
+struct virtnet_tx_cb {
+    dma_addr_t iova_start;
+    u32 total_len;
+};
+#define VIRTNET_TX_CB(skb) ((struct virtnet_tx_cb *)((skb)->cb))
 
 
 static bool csum = true, gso = true, napi_tx = true;
@@ -157,6 +179,11 @@ struct send_queue {
 
 	/* Record whether sq is in reset state. */
 	bool reset;
+
+	/* F&S: FANDs IOVA management */
+	dma_addr_t fands_base;
+  u64 fands_offset;
+  dma_addr_t last_sync_iova;
 };
 
 /* Internal representation of a receive virtqueue */
@@ -300,6 +327,8 @@ struct virtnet_info {
 
 	/* failover when STANDBY feature enabled */
 	struct failover *failover;
+
+	struct fands_tx_topology tx_iova_pool[16];
 };
 
 struct padded_vnet_hdr {
@@ -1489,10 +1518,14 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 
 		for (i = 0; i < VIRTIO_NET_FANDS_BATCH_SIZE; i++) {
 			struct page_frag *alloc_frag = &rq->alloc_frag;
-			unsigned int headroom = virtnet_get_headroom(vi);
-			unsigned int tailroom = headroom ? sizeof(struct skb_shared_info) : 0;
-			unsigned int room = SKB_DATA_ALIGN(headroom + tailroom);
+			
+			unsigned int base_headroom = virtnet_get_headroom(vi);
+			unsigned int fands_pad = ALIGN(FANDS_METADATA_SIZE, 8);
+			unsigned int tailroom = base_headroom ? sizeof(struct skb_shared_info) : 0;
+			unsigned int room = SKB_DATA_ALIGN(base_headroom + tailroom + fands_pad);
+			
 			unsigned int len, hole;
+			char *frag_start;
 			char *buf;
 			struct fands_iova_info *fands_ctx;
 			dma_addr_t iova_array[1];
@@ -1505,8 +1538,11 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 
 			pages[i] = alloc_frag->page;
 			get_page(pages[i]);
-			char *fragment_start = (char *)page_address(pages[i]) + alloc_frag->offset;
-			buf = fragment_start + headroom;
+			
+			frag_start = (char *)page_address(pages[i]) + alloc_frag->offset;
+			
+			buf = frag_start + base_headroom + fands_pad;
+			
 			alloc_frag->offset += len + room;
 			hole = alloc_frag->size - alloc_frag->offset;
 			if (hole < len + room) {
@@ -1515,24 +1551,25 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 			}
 
 			iovas[i] = iova_base + (i * PAGE_SIZE);
+			
 			if (dma_mapping_error(dev, iommu_dma_map_page_iova(dev, pages[i], iovas[i], (i==0), 0, PAGE_SIZE, DMA_FROM_DEVICE, 0))) {
 				put_page(pages[i]);
 				ret = -ENOMEM;
 				goto cleanup;
 			}
 
-			fands_ctx = (struct fands_iova_info *)fragment_start;
-
+			fands_ctx = (struct fands_iova_info *)(frag_start + base_headroom);
 			fands_ctx->is_fands = true;
 			fands_ctx->iova_base = iova_base;
 			fands_ctx->batch_idx = i;
 			fands_ctx->batch_size = VIRTIO_NET_FANDS_BATCH_SIZE;
-			fands_ctx->orig_ctx = mergeable_len_to_ctx(len, headroom);
+			fands_ctx->orig_ctx = mergeable_len_to_ctx(len, base_headroom);
 			
-			sg_init_one(rq->sg, buf, len); // sg는 'buf' (데이터 포인터)를 가리킴
+			sg_init_one(rq->sg, buf, len);
 			iova_array[0] = iovas[i];
 
 			void *ctx_with_tag = (void *)((unsigned long)fands_ctx | 1UL);
+			
 			ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, buf, ctx_with_tag, gfp);
 			if (ret < 0) {
 				iommu_dma_unmap_page_iova(dev, iovas[i], PAGE_SIZE, 0, false, DMA_FROM_DEVICE, 0);
@@ -1543,18 +1580,10 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 		return 0;
 
 	cleanup:
-		for (j = 0; j < i; j++) {
-			// A robust implementation would need to detach buffers from the virtqueue.
-			// For this example, we just unmap, acknowledging this is incomplete.
-			iommu_dma_unmap_page_iova(dev, iovas[j], PAGE_SIZE, 0, false, DMA_FROM_DEVICE, 0);
-			put_page(pages[j]);
-		}
-		// Free the main IOVA block if we failed before adding any buffers.
-		// The unmap logic in receive_mergeable will handle it otherwise.
-		if (i == 0) {
-			// The patch exports iommu_dma_free_iova, but a full implementation
-			// needs to be careful about how it's called.
-			// iommu_dma_free_iova(iommu_get_dma_domain(dev), iova_base, iova_alloc_size, NULL);
+		if (i > 0) {
+			iommu_dma_unmap_page_iova(dev, iova_base, iova_alloc_size, iova_alloc_size, true, DMA_FROM_DEVICE, 0);
+		} else {
+      iommu_dma_unmap_page_iova(dev, iova_base, 0, iova_alloc_size, true, DMA_FROM_DEVICE, 0);
 		}
 		return ret;
 	}
@@ -1717,6 +1746,11 @@ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
 	unsigned int bytes = 0;
 	void *ptr;
 
+	struct virtnet_info *vi = sq->vq->vdev->priv;
+	bool iommu_on = device_iommu_mapped(&vi->vdev->dev);
+	dma_addr_t batch_start = 0;
+	size_t batch_len = 0;
+
 	while ((ptr = virtqueue_get_buf(sq->vq, &len)) != NULL) {
 		if (likely(!is_xdp_frame(ptr))) {
 			struct sk_buff *skb = ptr;
@@ -1724,6 +1758,22 @@ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
 			pr_debug("Sent skb %p\n", skb);
 
 			bytes += skb->len;
+
+			if (iommu_on) {
+				struct virtnet_tx_cb *cb = VIRTNET_TX_CB(skb);
+				
+				if (batch_len > 0 && (batch_start + batch_len == cb->iova_start)) {
+					batch_len += cb->total_len;
+				} else {
+					if (batch_len > 0) {
+						iommu_dma_unmap_page_iova(&vi->vdev->dev, batch_start, batch_len, 
+									  0, false, DMA_TO_DEVICE, 0);
+					}
+					batch_start = cb->iova_start;
+					batch_len = cb->total_len;
+				}
+			}
+
 			napi_consume_skb(skb, in_napi);
 		} else {
 			struct xdp_frame *frame = ptr_to_xdp(ptr);
@@ -1732,6 +1782,11 @@ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
 			xdp_return_frame(frame);
 		}
 		packets++;
+	}
+
+	if (iommu_on && batch_len > 0) {
+		iommu_dma_unmap_page_iova(&vi->vdev->dev, batch_start, batch_len, 
+					  0, false, DMA_TO_DEVICE, 0);
 	}
 
 	/* Avoid overhead when no packets have been processed
@@ -1950,6 +2005,134 @@ static netdev_tx_t start_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct netdev_queue *txq = netdev_get_tx_queue(dev, qnum);
 	bool kick = !netdev_xmit_more();
 	bool use_napi = sq->napi.weight;
+
+	// F&S IOVA
+	if (device_iommu_mapped(&vi->vdev->dev)) {
+		dma_addr_t iova_start;
+		dma_addr_t curr_iova;
+		dma_addr_t iova_list[MAX_SKB_FRAGS + 2];
+		u64 req_size = 0;
+		int num_sg, i;
+		struct virtio_net_hdr_mrg_rxbuf *hdr;
+		unsigned hdr_len = vi->hdr_len;
+		bool can_push;
+
+		can_push = vi->any_header_sg &&
+			!((unsigned long)skb->data & (__alignof__(*hdr) - 1)) &&
+			!skb_header_cloned(skb) && skb_headroom(skb) >= hdr_len;
+
+		if (can_push)
+			hdr = (struct virtio_net_hdr_mrg_rxbuf *)(skb->data - hdr_len);
+		else
+			hdr = skb_vnet_hdr(skb);
+
+		if (virtio_net_hdr_from_skb(skb, &hdr->hdr,
+					    virtio_is_little_endian(vi->vdev), false, 0))
+			return NETDEV_TX_OK; // Drop
+
+		if (vi->mergeable_rx_bufs)
+			hdr->num_buffers = 0;
+
+		req_size += hdr_len;
+		req_size += skb_headlen(skb);
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
+			req_size += skb_frag_size(&skb_shinfo(skb)->frags[i]);
+		
+		u64 alloc_size = ALIGN(req_size, PAGE_SIZE);
+
+		if (sq->fands_offset + alloc_size > FANDS_TX_POOL_SIZE) {
+			sq->fands_offset = 0;
+		}
+
+		iova_start = sq->fands_base + sq->fands_offset;
+		sq->fands_offset += alloc_size;
+		curr_iova = iova_start;
+
+		sg_init_table(sq->sg, skb_shinfo(skb)->nr_frags + (can_push ? 1 : 2));
+		int sg_idx = 0;
+
+		if (can_push) {
+			__skb_push(skb, hdr_len);
+			struct page *p = virt_to_page(skb->data);
+			unsigned int off = offset_in_page(skb->data);
+			unsigned int len = skb_headlen(skb);
+			
+			iommu_dma_map_page_iova(&vi->vdev->dev, p, curr_iova, 
+                                    true /* first */, off, len, DMA_TO_DEVICE, 0);
+			
+      sg_set_page(&sq->sg[sg_idx], p, len, off);
+			sq->sg[sg_idx].dma_address = curr_iova;
+			iova_list[sg_idx] = curr_iova;
+			curr_iova += len;
+			sg_idx++;
+			
+			__skb_pull(skb, hdr_len); 
+		} else {
+			struct page *p = virt_to_page(hdr);
+			iommu_dma_map_page_iova(&vi->vdev->dev, p, curr_iova, 
+                                    true /* first */, offset_in_page(hdr), hdr_len, DMA_TO_DEVICE, 0);
+			
+      sg_set_buf(&sq->sg[sg_idx], hdr, hdr_len);
+			sq->sg[sg_idx].dma_address = curr_iova;
+			iova_list[sg_idx] = curr_iova;
+			curr_iova += hdr_len;
+			sg_idx++;
+            
+      if (skb_headlen(skb)) {
+          p = virt_to_page(skb->data);
+          unsigned int len = skb_headlen(skb);
+          iommu_dma_map_page_iova(&vi->vdev->dev, p, curr_iova, 
+                                  false, offset_in_page(skb->data), len, DMA_TO_DEVICE, 0);
+          sg_set_page(&sq->sg[sg_idx], p, len, offset_in_page(skb->data));
+          sq->sg[sg_idx].dma_address = curr_iova;
+          iova_list[sg_idx] = curr_iova;
+          curr_iova += len;
+          sg_idx++;
+      }
+		}
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			unsigned int len = skb_frag_size(frag);
+			
+			iommu_dma_map_page_iova(&vi->vdev->dev, skb_frag_page(frag), curr_iova,
+						false, skb_frag_off(frag), len, DMA_TO_DEVICE, 0);
+			
+			sg_set_page(&sq->sg[sg_idx], skb_frag_page(frag), len, skb_frag_off(frag));
+			sq->sg[sg_idx].dma_address = curr_iova;
+			iova_list[sg_idx] = curr_iova;
+			curr_iova += len;
+			sg_idx++;
+		}
+		
+		sg_mark_end(&sq->sg[sg_idx - 1]);
+		num_sg = sg_idx;
+
+		VIRTNET_TX_CB(skb)->iova_start = iova_start;
+		VIRTNET_TX_CB(skb)->total_len = alloc_size;
+
+		err = virtqueue_add_outbuf_iova(sq->vq, sq->sg, num_sg, iova_list, skb, GFP_ATOMIC);
+		
+		if (unlikely(err)) {
+      iommu_dma_unmap_page_iova(&vi->vdev->dev, iova_start, alloc_size, 
+                                      0, false, DMA_TO_DEVICE, 0);
+            
+      sq->fands_offset -= alloc_size; 
+      dev->stats.tx_fifo_errors++;
+      dev->stats.tx_dropped++;
+      dev_kfree_skb_any(skb);
+      return NETDEV_TX_OK;
+    }
+        
+    if (kick || netif_xmit_stopped(txq)) {
+        if (virtqueue_kick_prepare(sq->vq) && virtqueue_notify(sq->vq)) {
+            u64_stats_update_begin(&sq->stats.syncp);
+            sq->stats.kicks++;
+            u64_stats_update_end(&sq->stats.syncp);
+        }
+    }
+    return NETDEV_TX_OK;
+	}
 
 	/* Free up any pending old buffers before queueing new ones. */
 	do {
@@ -3450,6 +3633,13 @@ static void virtnet_free_queues(struct virtnet_info *vi)
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		__netif_napi_del(&vi->rq[i].napi);
 		__netif_napi_del(&vi->sq[i].napi);
+
+		if (vi->sq[i].fands_base) {
+      iommu_dma_unmap_page_iova(&vi->vdev->dev, vi->sq[i].fands_base, 
+                               FANDS_TX_POOL_SIZE, FANDS_TX_POOL_SIZE, 
+                               true, DMA_TO_DEVICE, 0);
+      vi->sq[i].fands_base = 0;
+    }
 	}
 
 	/* We called __netif_napi_del(),
@@ -3676,10 +3866,32 @@ static int virtnet_alloc_queues(struct virtnet_info *vi)
 
 		u64_stats_init(&vi->rq[i].stats.syncp);
 		u64_stats_init(&vi->sq[i].stats.syncp);
+
+		if (device_iommu_mapped(&vi->vdev->dev)) {
+      vi->sq[i].fands_base = iommu_dma_alloc_iova(
+          iommu_get_dma_domain(&vi->vdev->dev),
+          FANDS_TX_POOL_SIZE, 
+          dma_get_mask(&vi->vdev->dev), 
+          &vi->vdev->dev
+      );
+      vi->sq[i].fands_offset = 0;
+      if (!vi->sq[i].fands_base) {
+        dev_err(&vi->vdev->dev, "Failed to alloc F&S TX pool for queue %d\n", i);
+				goto err_fands;
+      }
+    }
 	}
 
 	return 0;
 
+err_fands:
+  while (--i >= 0) {
+    if (vi->sq[i].fands_base) {
+      iommu_dma_unmap_page_iova(&vi->vdev->dev, vi->sq[i].fands_base, 
+                                  FANDS_TX_POOL_SIZE, FANDS_TX_POOL_SIZE, 
+                                  true, DMA_TO_DEVICE, 0);
+    }
+  }
 err_rq:
 	kfree(vi->sq);
 err_sq:

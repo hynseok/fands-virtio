@@ -2147,6 +2147,26 @@ int virtqueue_add_outbuf(struct virtqueue *vq,
 EXPORT_SYMBOL_GPL(virtqueue_add_outbuf);
 
 /**
+ * virtqueue_add_outbuf_iova - expose output buffers with pre-mapped IOVA
+ * @vq: the struct virtqueue we're talking about.
+ * @sg: scatterlist (must be well-formed and terminated!)
+ * @num: the number of entries in @sg readable by other side
+ * @iovas: array of pre-mapped dma_addr_t for each sg entry
+ * @data: the token identifying the buffer.
+ * @gfp: how to do memory allocations (if necessary).
+ */
+int virtqueue_add_outbuf_iova(struct virtqueue *vq,
+			struct scatterlist *sg, unsigned int num,
+			dma_addr_t *iovas,
+			void *data,
+			gfp_t gfp)
+{
+    // virtqueue_add_outbuf는 num=1 (out), num=0 (in)으로 호출됨
+	return virtqueue_add_split_iova(vq, &sg, num, 1, 0, iovas, data, NULL, gfp);
+}
+EXPORT_SYMBOL_GPL(virtqueue_add_outbuf_iova);
+
+/**
  * virtqueue_add_inbuf - expose input buffers to other end
  * @vq: the struct virtqueue we're talking about.
  * @sg: scatterlist (must be well-formed and terminated!)
