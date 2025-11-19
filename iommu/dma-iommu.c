@@ -707,19 +707,13 @@ static void __iommu_dma_unmap_iova(struct device *dev, dma_addr_t dma_addr,
 	dma_addr -= iova_off;
 	size = iova_align(iovad, size + iova_off);
 	iommu_iotlb_gather_init(&iotlb_gather);
-
-	if (!free_iova) {
-		iotlb_gather.queued = true;
-	} else {
-		iotlb_gather.queued = READ_ONCE(cookie->fq_domain);
-	}	
+	iotlb_gather.queued = READ_ONCE(cookie->fq_domain);
 
 	unmapped = iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather);
 	WARN_ON(unmapped != size);
-	
-	if (free_iova) {
+
+	if (!iotlb_gather.queued)
 		iommu_iotlb_sync(domain, &iotlb_gather);
-	}
 
 	if (free_iova) {
 		/* dma_addr is the last page aligned byte in the range, we need to give it the first. Hacky, but for now just subtract 63 * 4096, assuming free_iova is only set on the last one */
