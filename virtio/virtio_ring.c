@@ -556,7 +556,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	bool indirect;
 
 	bool first_iova = (iova_size > 0 && !free_iova);
-
+	dma_addr_t addr;
+	
 	START_USE(vq);
 
 	BUG_ON(data == NULL);
@@ -609,7 +610,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 
 	for (n = 0; n < out_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
-			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_TO_DEVICE);
+			addr = vring_map_one_sg(vq, sg, DMA_TO_DEVICE, 0, false);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
@@ -619,7 +620,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			 */
 			i = virtqueue_add_desc_split(_vq, desc, i, addr, sg->length,
 						     VRING_DESC_F_NEXT,
-						     indirect);
+						     indirect, 0, false);
 		}
 	}
 	for (; n < (out_sgs + in_sgs); n++) {
@@ -632,7 +633,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 				target_iova = iova_base;
 			}
 
-			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE);
+			addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE, 0, false);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
@@ -667,7 +668,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 					 head, addr,
 					 total_sg * sizeof(struct vring_desc),
 					 VRING_DESC_F_INDIRECT,
-					 false);
+					 false, 0, false);
 	}
 
 	/* We're using some buffers from the free list. */
@@ -1297,7 +1298,7 @@ static int virtqueue_add_indirect_packed(struct vring_virtqueue *vq,
 	for (n = 0; n < out_sgs + in_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
 			addr = vring_map_one_sg(vq, sg, n < out_sgs ?
-					DMA_TO_DEVICE : DMA_FROM_DEVICE);
+					DMA_TO_DEVICE : DMA_FROM_DEVICE, 0, false);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
@@ -1444,7 +1445,7 @@ static inline int virtqueue_add_packed(struct virtqueue *_vq,
 	for (n = 0; n < out_sgs + in_sgs; n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
 			dma_addr_t addr = vring_map_one_sg(vq, sg, n < out_sgs ?
-					DMA_TO_DEVICE : DMA_FROM_DEVICE);
+					DMA_TO_DEVICE : DMA_FROM_DEVICE, 0, false);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
