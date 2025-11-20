@@ -1449,7 +1449,7 @@ static unsigned int get_mergeable_buf_len(struct receive_queue *rq,
 	return ALIGN(len, L1_CACHE_BYTES);
 }
 
-static int add_recvbuf_mergeable(struct virtnet_info *vi,
+static noinline int add_recvbuf_mergeable(struct virtnet_info *vi,
 				 struct receive_queue *rq, gfp_t gfp)
 {
 	struct page_frag *alloc_frag = &rq->alloc_frag;
@@ -1461,6 +1461,41 @@ static int add_recvbuf_mergeable(struct virtnet_info *vi,
 	int err;
 	unsigned int len, hole;
 
+	bool use_fns = false;
+  dma_addr_t my_iova = 0;
+  size_t iova_alloc_size = 0;
+  bool free_iova = false;
+  struct device *pdev = vi->vdev->dev.parent;
+
+	if (pdev && device_iommu_mapped(pdev)) {
+    use_fns = true;
+  } else {
+    static unsigned long last_print = 0;
+    if (time_after(jiffies, last_print + 5*HZ)) {
+        last_print = jiffies;
+        if (!pdev) printk(KERN_ERR "Virtio-FNS: Parent device is NULL\n");
+        else printk(KERN_ERR "Virtio-FNS: Device is NOT IOMMU mapped (Check QEMU iommu_platform=on)\n");
+    }
+  }
+
+  if (use_fns && rq->batch_remaining <= 0) {
+   	struct iommu_domain *domain = iommu_get_dma_domain(pdev);
+   	if (!domain) {
+   	  if (net_ratelimit()) printk(KERN_ERR "Virtio-FNS: Failed to get IOMMU Domain\n");
+   	  use_fns = false;
+   	} else {
+   	  size_t batch_bytes = 64 * PAGE_SIZE; 
+   	  rq->batch_head_iova = iommu_dma_alloc_iova(domain, batch_bytes, DMA_BIT_MASK(64), pdev);
+	
+   	  if (rq->batch_head_iova) {
+   	    rq->batch_remaining = 64;
+   	    printk(KERN_INFO "Virtio-FNS: New Batch Allocated! IOVA: %llx\n", rq->batch_head_iova);
+   	  } else {
+   	    if (net_ratelimit()) printk(KERN_ERR "Virtio-FNS: iommu_dma_alloc_iova Failed! (OOM or fragmentation)\n");
+   	    use_fns = false;
+   	  }
+   	}
+  }
 	/* Extra tailroom is needed to satisfy XDP's assumption. This
 	 * means rx frags coalescing won't work, but consider we've
 	 * disabled GSO for XDP, it won't be a big issue.
