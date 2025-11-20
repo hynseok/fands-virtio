@@ -19,31 +19,24 @@
 #include <linux/average.h>
 #include <linux/filter.h>
 #include <linux/kernel.h>
+#include <linux/dma-iommu.h>
+#include <linux/iommu.h>
 #include <net/route.h>
 #include <net/xdp.h>
 #include <net/net_failover.h>
-#include <linux/dma-iommu.h>
-#include <linux/iommu.h>
 
-// Forward declaration for F&S function
+// Fast and Safe IO
 extern int virtqueue_add_inbuf_iova(struct virtqueue *vq,
 			struct scatterlist *sg, unsigned int num,
-			dma_addr_t *iovas,
 			void *data,
 			void *ctx,
-			gfp_t gfp);
+			gfp_t gfp,
+      dma_addr_t iova, size_t iova_size, bool free_iova);
+
+#define FNS_BATCH_SIZE 64
 
 static int napi_weight = NAPI_POLL_WEIGHT;
 module_param(napi_weight, int, 0444);
-
-struct fands_iova_info {
-	bool is_fands;
-	dma_addr_t iova_base;
-	u16 batch_idx;
-	u16 batch_size;
-	void *orig_ctx;
-};
-
 
 static bool csum = true, gso = true, napi_tx = true;
 module_param(csum, bool, 0444);
@@ -189,6 +182,10 @@ struct receive_queue {
 	char name[40];
 
 	struct xdp_rxq_info xdp_rxq;
+
+	// Fast and Safe IO
+	dma_addr_t batch_head_iova;
+	int batch_remaining;
 };
 
 /* This structure can contain rss message with maximum settings for indirection table and keysize
@@ -959,31 +956,6 @@ static struct sk_buff *receive_mergeable(struct net_device *dev,
 					 unsigned int *xdp_xmit,
 					 struct virtnet_rq_stats *stats)
 {
-	//struct fands_iova_info *fands_ctx = (struct fands_iova_info *)ctx;
-	//if (fands_ctx && fands_ctx->is_fands) {
-	//	struct device *pdev = vi->vdev->dev.parent;
-	//	dma_addr_t iova = fands_ctx->iova_base + (fands_ctx->batch_idx * PAGE_SIZE);
-	//	bool last_buf = (fands_ctx->batch_idx == fands_ctx->batch_size - 1);
-	//	unsigned long iova_alloc_size = PAGE_SIZE * fands_ctx->batch_size;
-
-	//	iommu_dma_unmap_page_iova(pdev, iova, PAGE_SIZE, iova_alloc_size, last_buf, DMA_FROM_DEVICE, 0);
-
-	//	ctx = fands_ctx->orig_ctx;
-	//	kfree(fands_ctx);
-	//}
-	
-	if ((unsigned long)ctx & 1UL) {
-		struct fands_iova_info *fands_ctx = (void *)((unsigned long)ctx & ~1UL);
-		struct device *pdev = vi->vdev->dev.parent;
-		dma_addr_t iova = fands_ctx->iova_base + (fands_ctx->batch_idx * PAGE_SIZE);
-		bool last_buf = (fands_ctx->batch_idx == fands_ctx->batch_size - 1);
-		unsigned long iova_alloc_size = PAGE_SIZE * fands_ctx->batch_size;
-
-		iommu_dma_unmap_page_iova(pdev, iova, PAGE_SIZE, iova_alloc_size, last_buf, DMA_FROM_DEVICE, 0);
-
-		ctx = fands_ctx->orig_ctx;
-	}
-
 	struct virtio_net_hdr_mrg_rxbuf *hdr = buf;
 	u16 num_buf = virtio16_to_cpu(vi->vdev, hdr->num_buffers);
 	struct page *page = virt_to_head_page(buf);
@@ -1352,6 +1324,31 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
 	int len = vi->hdr_len + VIRTNET_RX_PAD + GOOD_PACKET_LEN + xdp_headroom;
 	int err;
 
+	// Fast and Safe IO
+	dma_addr_t my_iova = 0;
+	size_t iova_alloc_size = 0;
+	bool free_iova = false;
+	bool use_fns = false;
+
+	if (vi->vdev->dev.parent && iommu_get_domain(vi->vdev->dev.parent)) {
+		use_fns = true;
+	}
+
+	if (use_fns) {
+		if (rq->batch_remaining <= 0) {
+			struct iommu_domain *domain = iommu_get_domain(vi->vdev->dev.parent);
+			size_t batch_bytes = FNS_BATCH_SIZE * PAGE_SIZE;
+
+			rq->batch_head_iova = iommu_dma_alloc_iova(domain, batch_bytes, DMA_BIT_MASK(64), vi->vdev->dev.parent);
+
+			if (rq->batch_head_iova) {
+				rq->batch_remaining = FNS_BATCH_SIZE;
+			} else {
+				use_fns = false;
+			}
+		}
+	}
+
 	len = SKB_DATA_ALIGN(len) +
 	      SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 	if (unlikely(!skb_page_frag_refill(len, alloc_frag, gfp)))
@@ -1362,7 +1359,25 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
 	alloc_frag->offset += len;
 	sg_init_one(rq->sg, buf + VIRTNET_RX_PAD + xdp_headroom,
 		    vi->hdr_len + GOOD_PACKET_LEN);
-	err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
+
+	if (use_fns && rq->batch_remaining > 0) {
+		int index = FNS_BATCH_SIZE - rq->batch_remaining;
+    my_iova = rq->batch_head_iova + (index * PAGE_SIZE);
+
+		iova_alloc_size = FNS_BATCH_SIZE * PAGE_SIZE;
+		        
+		if (rq->batch_remaining == 1) {
+      free_iova = true;
+    }
+        
+    rq->batch_remaining--;
+
+		err = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, buf, ctx, gfp,
+                                       my_iova, iova_alloc_size, free_iova);
+	} else {
+		err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
+	}
+
 	if (err < 0)
 		put_page(virt_to_head_page(buf));
 	return err;
@@ -1434,130 +1449,47 @@ static unsigned int get_mergeable_buf_len(struct receive_queue *rq,
 	return ALIGN(len, L1_CACHE_BYTES);
 }
 
-#define VIRTIO_NET_FANDS_BATCH_SIZE 64
-
 static int add_recvbuf_mergeable(struct virtnet_info *vi,
 				 struct receive_queue *rq, gfp_t gfp)
 {
-	struct device *dev = vi->vdev->dev.parent;
+	struct page_frag *alloc_frag = &rq->alloc_frag;
+	unsigned int headroom = virtnet_get_headroom(vi);
+	unsigned int tailroom = headroom ? sizeof(struct skb_shared_info) : 0;
+	unsigned int room = SKB_DATA_ALIGN(headroom + tailroom);
+	char *buf;
+	void *ctx;
+	int err;
+	unsigned int len, hole;
 
-	if (!device_iommu_mapped(dev)) {
-		// Original path if no IOMMU
-		struct page_frag *alloc_frag = &rq->alloc_frag;
-		unsigned int headroom = virtnet_get_headroom(vi);
-		unsigned int tailroom = headroom ? sizeof(struct skb_shared_info) : 0;
-		unsigned int room = SKB_DATA_ALIGN(headroom + tailroom);
-		char *buf;
-		void *ctx;
-		int err;
-		unsigned int len, hole;
+	/* Extra tailroom is needed to satisfy XDP's assumption. This
+	 * means rx frags coalescing won't work, but consider we've
+	 * disabled GSO for XDP, it won't be a big issue.
+	 */
+	len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
+	if (unlikely(!skb_page_frag_refill(len + room, alloc_frag, gfp)))
+		return -ENOMEM;
 
-		len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
-		if (unlikely(!skb_page_frag_refill(len + room, alloc_frag, gfp)))
-			return -ENOMEM;
-
-		buf = (char *)page_address(alloc_frag->page) + alloc_frag->offset;
-		buf += headroom;
-		get_page(alloc_frag->page);
-		alloc_frag->offset += len + room;
-		hole = alloc_frag->size - alloc_frag->offset;
-		if (hole < len + room) {
-			len += hole;
-			alloc_frag->offset += hole;
-		}
-
-		sg_init_one(rq->sg, buf, len);
-		ctx = mergeable_len_to_ctx(len, headroom);
-		err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
-		if (err < 0)
-			put_page(virt_to_head_page(buf));
-
-		return err;
-	} else {
-		// F&S IOVA Path
-		dma_addr_t iova_base;
-		unsigned long iova_alloc_size = PAGE_SIZE * VIRTIO_NET_FANDS_BATCH_SIZE;
-		struct page *pages[VIRTIO_NET_FANDS_BATCH_SIZE];
-		dma_addr_t iovas[VIRTIO_NET_FANDS_BATCH_SIZE];
-		int i, j;
-		int ret = 0;
-
-		iova_base = iommu_dma_alloc_iova(iommu_get_dma_domain(dev),
-						 iova_alloc_size, dma_get_mask(dev), dev);
-		if (!iova_base)
-			return -ENOMEM;
-
-		for (i = 0; i < VIRTIO_NET_FANDS_BATCH_SIZE; i++) {
-			struct page_frag *alloc_frag = &rq->alloc_frag;
-			unsigned int headroom = virtnet_get_headroom(vi);
-			unsigned int tailroom = headroom ? sizeof(struct skb_shared_info) : 0;
-			unsigned int room = SKB_DATA_ALIGN(headroom + tailroom);
-			unsigned int len, hole;
-			char *buf;
-			struct fands_iova_info *fands_ctx;
-			dma_addr_t iova_array[1];
-
-			len = get_mergeable_buf_len(rq, &rq->mrg_avg_pkt_len, room);
-			if (unlikely(!skb_page_frag_refill(len + room, alloc_frag, gfp))) {
-				ret = -ENOMEM;
-				goto cleanup;
-			}
-
-			pages[i] = alloc_frag->page;
-			get_page(pages[i]);
-			char *fragment_start = (char *)page_address(pages[i]) + alloc_frag->offset;
-			buf = fragment_start + headroom;
-			alloc_frag->offset += len + room;
-			hole = alloc_frag->size - alloc_frag->offset;
-			if (hole < len + room) {
-				len += hole;
-				alloc_frag->offset += hole;
-			}
-
-			iovas[i] = iova_base + (i * PAGE_SIZE);
-			if (dma_mapping_error(dev, iommu_dma_map_page_iova(dev, pages[i], iovas[i], (i==0), 0, PAGE_SIZE, DMA_FROM_DEVICE, 0))) {
-				put_page(pages[i]);
-				ret = -ENOMEM;
-				goto cleanup;
-			}
-
-			fands_ctx = (struct fands_iova_info *)fragment_start;
-
-			fands_ctx->is_fands = true;
-			fands_ctx->iova_base = iova_base;
-			fands_ctx->batch_idx = i;
-			fands_ctx->batch_size = VIRTIO_NET_FANDS_BATCH_SIZE;
-			fands_ctx->orig_ctx = mergeable_len_to_ctx(len, headroom);
-			
-			sg_init_one(rq->sg, buf, len); // sg는 'buf' (데이터 포인터)를 가리킴
-			iova_array[0] = iovas[i];
-
-			void *ctx_with_tag = (void *)((unsigned long)fands_ctx | 1UL);
-			ret = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, iova_array, buf, ctx_with_tag, gfp);
-			if (ret < 0) {
-				iommu_dma_unmap_page_iova(dev, iovas[i], PAGE_SIZE, 0, false, DMA_FROM_DEVICE, 0);
-				put_page(pages[i]);
-				goto cleanup;
-			}
-		}
-		return 0;
-
-	cleanup:
-		for (j = 0; j < i; j++) {
-			// A robust implementation would need to detach buffers from the virtqueue.
-			// For this example, we just unmap, acknowledging this is incomplete.
-			iommu_dma_unmap_page_iova(dev, iovas[j], PAGE_SIZE, 0, false, DMA_FROM_DEVICE, 0);
-			put_page(pages[j]);
-		}
-		// Free the main IOVA block if we failed before adding any buffers.
-		// The unmap logic in receive_mergeable will handle it otherwise.
-		if (i == 0) {
-			// The patch exports iommu_dma_free_iova, but a full implementation
-			// needs to be careful about how it's called.
-			// iommu_dma_free_iova(iommu_get_dma_domain(dev), iova_base, iova_alloc_size, NULL);
-		}
-		return ret;
+	buf = (char *)page_address(alloc_frag->page) + alloc_frag->offset;
+	buf += headroom; /* advance address leaving hole at front of pkt */
+	get_page(alloc_frag->page);
+	alloc_frag->offset += len + room;
+	hole = alloc_frag->size - alloc_frag->offset;
+	if (hole < len + room) {
+		/* To avoid internal fragmentation, if there is very likely not
+		 * enough space for another buffer, add the remaining space to
+		 * the current buffer.
+		 */
+		len += hole;
+		alloc_frag->offset += hole;
 	}
+
+	sg_init_one(rq->sg, buf, len);
+	ctx = mergeable_len_to_ctx(len, headroom);
+	err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
+	if (err < 0)
+		put_page(virt_to_head_page(buf));
+
+	return err;
 }
 
 /*
@@ -2115,7 +2047,7 @@ static bool virtnet_send_command(struct virtnet_info *vi, u8 class, u8 cmd,
 	BUG_ON(out_num + 1 > ARRAY_SIZE(sgs));
 	ret = virtqueue_add_sgs(vi->cvq, sgs, out_num, 1, vi, GFP_ATOMIC);
 	if (ret < 0) {
-		dev_warn(vi->vdev->dev.parent,
+		dev_warn(&vi->vdev->dev,
 			 "Failed to add sgs for command vq: %d\n.", ret);
 		return false;
 	}

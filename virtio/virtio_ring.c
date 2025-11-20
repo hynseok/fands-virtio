@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/hrtimer.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-iommu.h>
 #include <linux/spinlock.h>
 #include <xen/xen.h>
 
@@ -83,6 +84,10 @@ struct vring_desc_extra {
 	u32 len;			/* Descriptor length. */
 	u16 flags;			/* Descriptor flags. */
 	u16 next;			/* The next desc state in a list. */
+
+	// Fast and Safe IO
+	u32 iova_size;
+	bool free_iova;
 };
 
 struct vring_virtqueue_split {
@@ -350,10 +355,19 @@ static inline struct device *vring_dma_dev(const struct vring_virtqueue *vq)
 /* Map one sg entry. */
 static dma_addr_t vring_map_one_sg(const struct vring_virtqueue *vq,
 				   struct scatterlist *sg,
-				   enum dma_data_direction direction)
+				   enum dma_data_direction direction,
+					 dma_addr_t iova, bool first_iova)
 {
 	if (!vq->use_dma_api)
 		return (dma_addr_t)sg_phys(sg);
+
+
+	// Fast and Safe IO
+	if (iova) {
+		return iommu_dma_map_page_iova(vring_dma_dev(vq),
+					      sg_page(sg), iova, first_iova, sg->offset, sg->length,
+					      direction, DMA_ATTR_SKIP_CPU_SYNC);
+	}
 
 	/*
 	 * We can't use dma_map_sg, because we don't use scatterlists in
@@ -443,11 +457,22 @@ static unsigned int vring_unmap_one_split(const struct vring_virtqueue *vq,
 				 (flags & VRING_DESC_F_WRITE) ?
 				 DMA_FROM_DEVICE : DMA_TO_DEVICE);
 	} else {
-		dma_unmap_page(vring_dma_dev(vq),
+		if (extra[i].iova_size) {
+			if(extra[i].free_iova) {
+				// Fast and Safe IO
+				iommu_dma_unmap_page_iova(vring_dma_dev(vq),
+							  extra[i].addr, extra[i].len,
+							  extra[i].iova_size, true,
+							  (flags & VRING_DESC_F_WRITE) ? DMA_FROM_DEVICE : DMA_TO_DEVICE,
+							  DMA_ATTR_SKIP_CPU_SYNC);
+			}
+		} else {
+			dma_unmap_page(vring_dma_dev(vq),
 			       extra[i].addr,
 			       extra[i].len,
 			       (flags & VRING_DESC_F_WRITE) ?
 			       DMA_FROM_DEVICE : DMA_TO_DEVICE);
+		}
 	}
 
 out:
@@ -483,7 +508,8 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 						    dma_addr_t addr,
 						    unsigned int len,
 						    u16 flags,
-						    bool indirect)
+						    bool indirect,
+								u32 iova_size, bool free_iova)
 {
 	struct vring_virtqueue *vring = to_vvq(vq);
 	struct vring_desc_extra *extra = vring->split.desc_extra;
@@ -500,6 +526,10 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 		extra[i].addr = addr;
 		extra[i].len = len;
 		extra[i].flags = flags;
+
+		// Fast and Safe IO
+		extra[i].iova_size = iova_size;
+		extra[i].free_iova = free_iova;
 	} else
 		next = virtio16_to_cpu(vq->vdev, desc[i].next);
 
@@ -513,7 +543,10 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 				      unsigned int in_sgs,
 				      void *data,
 				      void *ctx,
-				      gfp_t gfp)
+				      gfp_t gfp,
+							dma_addr_t iova_base,
+							size_t iova_size,
+							bool free_iova)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	struct scatterlist *sg;
@@ -521,6 +554,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	unsigned int i, n, avail, descs_used, prev, err_idx;
 	int head;
 	bool indirect;
+
+	bool first_iova = (iova_size > 0 && !free_iova);
 
 	START_USE(vq);
 
@@ -589,6 +624,14 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	}
 	for (; n < (out_sgs + in_sgs); n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
+
+			// Fast and Safe IO
+			dma_addr_t target_iova = 0;
+
+			if(iova_base && !indirect) {
+				target_iova = iova_base;
+			}
+
 			dma_addr_t addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
@@ -601,7 +644,9 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 						     sg->length,
 						     VRING_DESC_F_NEXT |
 						     VRING_DESC_F_WRITE,
-						     indirect);
+						     indirect,
+								 indirect ? 0 : iova_size,
+								 indirect ? false : free_iova);
 		}
 	}
 	/* Last one doesn't continue. */
@@ -2086,7 +2131,7 @@ static inline int virtqueue_add(struct virtqueue *_vq,
 	return vq->packed_ring ? virtqueue_add_packed(_vq, sgs, total_sg,
 					out_sgs, in_sgs, data, ctx, gfp) :
 				 virtqueue_add_split(_vq, sgs, total_sg,
-					out_sgs, in_sgs, data, ctx, gfp);
+					out_sgs, in_sgs, data, ctx, gfp, 0, 0, false);
 }
 
 /**
@@ -2168,6 +2213,18 @@ int virtqueue_add_inbuf(struct virtqueue *vq,
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_inbuf);
 
+// Fast and Safe IO
+int virtqueue_add_inbuf_iova(struct virtqueue *vq,
+			struct scatterlist *sg, unsigned int num,
+			void *data,
+			void *ctx,
+			gfp_t gfp,
+            dma_addr_t iova, size_t iova_size, bool free_iova)
+{
+	return virtqueue_add_split(vq, &sg, num, 0, 1, data, ctx, gfp, iova, iova_size, free_iova);
+}
+EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_iova);
+
 /**
  * virtqueue_add_inbuf_ctx - expose input buffers to other end
  * @vq: the struct virtqueue we're talking about.
@@ -2188,152 +2245,9 @@ int virtqueue_add_inbuf_ctx(struct virtqueue *vq,
 			void *ctx,
 			gfp_t gfp)
 {
-	return virtqueue_add(vq, &sg, num, 0, 1, data, ctx, gfp);
+	return virtqueue_add_split(vq, &sg, num, 0, 1, data, ctx, gfp, 0, 0, false);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_ctx);
-
-// F&S IOVA-specific implementation
-static int virtqueue_add_split_iova(struct virtqueue *_vq,
-				      struct scatterlist *sgs[],
-				      unsigned int total_sg,
-				      unsigned int out_sgs,
-				      unsigned int in_sgs,
-					  dma_addr_t *iovas, // The array of pre-mapped IOVAs
-				      void *data,
-				      void *ctx,
-				      gfp_t gfp)
-{
-	struct vring_virtqueue *vq = to_vvq(_vq);
-	struct scatterlist *sg;
-	struct vring_desc *desc;
-	unsigned int i, n, avail, descs_used, prev;
-	int head;
-	int iova_idx = 0;
-
-	START_USE(vq);
-
-	BUG_ON(data == NULL);
-	// BUG_ON(ctx != NULL);
-
-	if (unlikely(vq->broken)) {
-		END_USE(vq);
-		return -EIO;
-	}
-
-	LAST_ADD_TIME_UPDATE(vq);
-	BUG_ON(total_sg == 0);
-
-	head = vq->free_head;
-	desc = vq->split.vring.desc;
-	i = head;
-	descs_used = total_sg;
-
-	if (unlikely(vq->vq.num_free < descs_used)) {
-		pr_debug("Can't add buf len %i - avail = %i\n",
-			 descs_used, vq->vq.num_free);
-		if (out_sgs)
-			vq->notify(&vq->vq);
-		END_USE(vq);
-		return -ENOSPC;
-	}
-
-	// This is an F&S-specific path, so we assume no indirect descriptors for simplicity
-	BUG_ON(virtqueue_use_indirect(vq, total_sg));
-
-	for (n = 0; n < out_sgs; n++) {
-		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
-			dma_addr_t addr = iovas[iova_idx++];
-			prev = i;
-			i = virtqueue_add_desc_split(_vq, desc, i, addr, sg->length,
-						     VRING_DESC_F_NEXT,
-						     false); // false for not-indirect
-		}
-	}
-	for (; n < (out_sgs + in_sgs); n++) {
-		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
-			dma_addr_t addr = iovas[iova_idx++];
-			prev = i;
-			i = virtqueue_add_desc_split(_vq, desc, i, addr,
-						     sg->length,
-						     VRING_DESC_F_NEXT |
-						     VRING_DESC_F_WRITE,
-						     false); // false for not-indirect
-		}
-	}
-
-	desc[prev].flags &= cpu_to_virtio16(_vq->vdev, ~VRING_DESC_F_NEXT);
-	// No need to touch desc_extra for F&S path as we don't unmap here
-
-	vq->vq.num_free -= descs_used;
-	vq->free_head = i;
-	vq->split.desc_state[head].data = data;
-	vq->split.desc_state[head].indir_desc = ctx;
-
-	avail = vq->split.avail_idx_shadow & (vq->split.vring.num - 1);
-	vq->split.vring.avail->ring[avail] = cpu_to_virtio16(_vq->vdev, head);
-
-	virtio_wmb(vq->weak_barriers);
-	vq->split.avail_idx_shadow++;
-	vq->split.vring.avail->idx = cpu_to_virtio16(_vq->vdev,
-						vq->split.avail_idx_shadow);
-	vq->num_added++;
-
-	pr_debug("Added buffer head %i to %p (F&S)\n", head, vq);
-	END_USE(vq);
-
-	if (unlikely(vq->num_added == (1 << 16) - 1))
-		virtqueue_kick(_vq);
-
-	return 0;
-}
-
-static inline int virtqueue_add_iova(struct virtqueue *_vq,
-				struct scatterlist *sgs[],
-				unsigned int total_sg,
-				unsigned int out_sgs,
-				unsigned int in_sgs,
-                dma_addr_t *iova,
-				void *data,
-				void *ctx,
-				gfp_t gfp)
-{
-	struct vring_virtqueue *vq = to_vvq(_vq);
-
-	if (vq->packed_ring) {
-		// Not implemented for packed rings yet
-		return -ENOSYS;
-    }
-
-	return virtqueue_add_split_iova(_vq, sgs, total_sg,
-					out_sgs, in_sgs, iova, data, ctx, gfp);
-}
-
-/**
- * virtqueue_add_inbuf_iova - expose input buffers with pre-mapped IOVA
- * @vq: the struct virtqueue we're talking about.
- * @sg: scatterlist (must be well-formed and terminated!)
- * @num: the number of entries in @sg writable by other side
- * @iovas: array of pre-mapped dma_addr_t for each sg entry
- * @data: the token identifying the buffer.
- * @gfp: how to do memory allocations (if necessary).
- *
- * F&S-specific variant of virtqueue_add_inbuf. It assumes the caller
- * has already mapped the buffer and provides the IOVA. This function
- * will not perform any DMA mapping or unmapping.
- *
- * Returns zero or a negative error (ie. ENOSPC, EIO).
- */
-int virtqueue_add_inbuf_iova(struct virtqueue *vq,
-			struct scatterlist *sg, unsigned int num,
-			dma_addr_t *iovas,
-			void *data,
-			void *ctx,
-			gfp_t gfp)
-{
-	return virtqueue_add_iova(vq, &sg, num, 0, 1, iovas, data, ctx, gfp);
-}
-EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_iova);
-
 
 /**
  * virtqueue_kick_prepare - first half of split virtqueue_kick call.
