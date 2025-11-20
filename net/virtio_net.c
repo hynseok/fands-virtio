@@ -1330,13 +1330,13 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
 	bool free_iova = false;
 	bool use_fns = false;
 
-	if (vi->vdev->dev.parent && iommu_get_domain(vi->vdev->dev.parent)) {
+	if (vi->vdev->dev.parent && iommu_get_dma_domain(vi->vdev->dev.parent)) {
 		use_fns = true;
 	}
 
 	if (use_fns) {
 		if (rq->batch_remaining <= 0) {
-			struct iommu_domain *domain = iommu_get_domain(vi->vdev->dev.parent);
+			struct iommu_domain *domain = iommu_get_dma_domain(vi->vdev->dev.parent);
 			size_t batch_bytes = FNS_BATCH_SIZE * PAGE_SIZE;
 
 			rq->batch_head_iova = iommu_dma_alloc_iova(domain, batch_bytes, DMA_BIT_MASK(64), vi->vdev->dev.parent);
