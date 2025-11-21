@@ -1375,7 +1375,7 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
     rq->batch_remaining--;
 
 		err = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, buf, ctx, gfp,
-                                       my_iova, iova_alloc_size, free_iova);
+                                       my_iova, iova_alloc_size, free_iova, is_head);
 	} else {
 		err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
 	}
