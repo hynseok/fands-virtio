@@ -633,7 +633,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 				target_iova = iova_base;
 			}
 
-			addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE, 0, false);
+			addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE, target_iova, first_iova);
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
