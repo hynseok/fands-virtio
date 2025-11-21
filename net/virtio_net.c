@@ -31,7 +31,7 @@ extern int virtqueue_add_inbuf_iova(struct virtqueue *vq,
 			void *data,
 			void *ctx,
 			gfp_t gfp,
-      dma_addr_t iova, size_t iova_size, bool free_iova);
+      dma_addr_t iova, size_t iova_size, bool free_iova, bool is_head);
 
 #define FNS_BATCH_SIZE 64
 
@@ -1329,6 +1329,7 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
 	size_t iova_alloc_size = 0;
 	bool free_iova = false;
 	bool use_fns = false;
+	bool is_head = false;
 
 	if (vi->vdev->dev.parent && iommu_get_dma_domain(vi->vdev->dev.parent)) {
 		use_fns = true;
@@ -1363,6 +1364,7 @@ static int add_recvbuf_small(struct virtnet_info *vi, struct receive_queue *rq,
 	if (use_fns && rq->batch_remaining > 0) {
 		int index = FNS_BATCH_SIZE - rq->batch_remaining;
     my_iova = rq->batch_head_iova + (index * PAGE_SIZE);
+		if (index == 0) is_head = true;
 
 		iova_alloc_size = FNS_BATCH_SIZE * PAGE_SIZE;
 		        
@@ -1466,6 +1468,7 @@ static noinline int add_recvbuf_mergeable(struct virtnet_info *vi,
   size_t iova_alloc_size = 0;
   bool free_iova = false;
   struct device *pdev = vi->vdev->dev.parent;
+	bool is_head = false;
 
 	if (pdev && device_iommu_mapped(pdev)) {
     use_fns = true;
@@ -1524,9 +1527,9 @@ static noinline int add_recvbuf_mergeable(struct virtnet_info *vi,
 	if (use_fns && rq->batch_remaining > 0) {
 		int index = 64 - rq->batch_remaining;
 		my_iova = rq->batch_head_iova + (index * PAGE_SIZE);
-
 		iova_alloc_size = 64 * PAGE_SIZE;
 
+		if (index == 0) is_head = true;
 		if (rq->batch_remaining == 1) {
 			free_iova = true;
 		}
@@ -1534,7 +1537,7 @@ static noinline int add_recvbuf_mergeable(struct virtnet_info *vi,
 		rq->batch_remaining--;
 
 		err = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, buf, ctx, gfp,
-																	 my_iova, iova_alloc_size, free_iova);
+																	 my_iova, iova_alloc_size, free_iova, is_head);
 	} else {
 		err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
 	}

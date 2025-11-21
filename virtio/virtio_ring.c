@@ -546,7 +546,8 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 				      gfp_t gfp,
 							dma_addr_t iova_base,
 							size_t iova_size,
-							bool free_iova)
+							bool free_iova,
+							bool is_head)
 {
 	struct vring_virtqueue *vq = to_vvq(_vq);
 	struct scatterlist *sg;
@@ -555,7 +556,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 	int head;
 	bool indirect;
 
-	bool first_iova = (iova_size > 0 && !free_iova);
+	bool first_iova = (iova_size > 0 && is_head);
 	dma_addr_t addr;
 	
 	START_USE(vq);
@@ -633,7 +634,11 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 				target_iova = iova_base;
 			}
 
-			addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE, 0, false);
+			addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE, target_iova, first_iova);
+
+			if (first_iova)
+				first_iova = false;
+				
 			if (vring_mapping_error(vq, addr))
 				goto unmap_release;
 
@@ -2132,7 +2137,7 @@ static inline int virtqueue_add(struct virtqueue *_vq,
 	return vq->packed_ring ? virtqueue_add_packed(_vq, sgs, total_sg,
 					out_sgs, in_sgs, data, ctx, gfp) :
 				 virtqueue_add_split(_vq, sgs, total_sg,
-					out_sgs, in_sgs, data, ctx, gfp, 0, 0, false);
+					out_sgs, in_sgs, data, ctx, gfp, 0, 0, false, false);
 }
 
 /**
@@ -2220,9 +2225,9 @@ int virtqueue_add_inbuf_iova(struct virtqueue *vq,
 			void *data,
 			void *ctx,
 			gfp_t gfp,
-            dma_addr_t iova, size_t iova_size, bool free_iova)
+            dma_addr_t iova, size_t iova_size, bool free_iova, bool is_head)
 {
-	return virtqueue_add_split(vq, &sg, num, 0, 1, data, ctx, gfp, iova, iova_size, free_iova);
+	return virtqueue_add_split(vq, &sg, num, 0, 1, data, ctx, gfp, iova, iova_size, free_iova, is_head);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_iova);
 
@@ -2246,7 +2251,7 @@ int virtqueue_add_inbuf_ctx(struct virtqueue *vq,
 			void *ctx,
 			gfp_t gfp)
 {
-	return virtqueue_add_split(vq, &sg, num, 0, 1, data, ctx, gfp, 0, 0, false);
+	return virtqueue_add_split(vq, &sg, num, 0, 1, data, ctx, gfp, 0, 0, false, false);
 }
 EXPORT_SYMBOL_GPL(virtqueue_add_inbuf_ctx);
 
