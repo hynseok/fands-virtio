@@ -1520,7 +1520,25 @@ static noinline int add_recvbuf_mergeable(struct virtnet_info *vi,
 
 	sg_init_one(rq->sg, buf, len);
 	ctx = mergeable_len_to_ctx(len, headroom);
-	err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
+
+	if (use_fns && rq->batch_remaining > 0) {
+		int index = 64 - rq->batch_remaining;
+		my_iova = rq->batch_head_iova + (index * PAGE_SIZE);
+
+		iova_alloc_size = 64 * PAGE_SIZE;
+
+		if (rq->batch_remaining == 1) {
+			free_iova = true;
+		}
+
+		rq->batch_remaining--;
+
+		err = virtqueue_add_inbuf_iova(rq->vq, rq->sg, 1, buf, ctx, gfp,
+																	 my_iova, iova_alloc_size, free_iova);
+	} else {
+		err = virtqueue_add_inbuf_ctx(rq->vq, rq->sg, 1, buf, ctx, gfp);
+	}
+
 	if (err < 0)
 		put_page(virt_to_head_page(buf));
 
