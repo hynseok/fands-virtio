@@ -687,6 +687,10 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	iotlb_gather.queued = READ_ONCE(cookie->fq_domain);
 
 	unmapped = iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather);
+	if (unmapped != size) {
+    printk(KERN_ERR "VIRTIO-FNS: Unmap mismatch! Req: %zu, Done: %zu, Addr: %llx\n", 
+           size, unmapped, dma_addr);
+	}
 	WARN_ON(unmapped != size);
 
 	if (!iotlb_gather.queued)
