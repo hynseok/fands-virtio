@@ -634,6 +634,10 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 
 			if(iova_base && !indirect) {
 				target_iova = iova_base;
+				if (target_iova & ~PAGE_MASK) {
+             pr_err("VIRTIO-FNS: Critical! Unaligned IOVA: %llx\n", target_iova);
+             BUG();
+        }
 			}
 
 			addr = vring_map_one_sg(vq, sg, DMA_FROM_DEVICE, 0, false);
