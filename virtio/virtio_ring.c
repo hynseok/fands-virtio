@@ -86,6 +86,7 @@ struct vring_desc_extra {
 	u16 next;			/* The next desc state in a list. */
 
 	// Fast and Safe IO
+	dma_addr_t iova_head;  /* IOVA address for the first page */
 	u32 iova_size;
 	bool free_iova;
 };
@@ -443,7 +444,6 @@ static unsigned int vring_unmap_one_split(const struct vring_virtqueue *vq,
 					  unsigned int i)
 {
 	struct vring_desc_extra *extra = vq->split.desc_extra;
-	dma_addr_t unmap_addr = extra[i].addr;
 	u16 flags;
 
 	if (!vq->use_dma_api)
@@ -461,10 +461,9 @@ static unsigned int vring_unmap_one_split(const struct vring_virtqueue *vq,
 		if (extra[i].iova_size) {
 			if(extra[i].free_iova) {
 				// Fast and Safe IO
-				unmap_addr = extra[i].addr - (extra[i].iova_size - PAGE_SIZE);
 				iommu_dma_unmap_page_iova(vring_dma_dev(vq),
-							  unmap_addr, 
-								extra[i].iova_size,
+							  extra[i].iova_head,
+								extra[i].len,
 							  extra[i].iova_size, true,
 							  (flags & VRING_DESC_F_WRITE) ? DMA_FROM_DEVICE : DMA_TO_DEVICE,
 							  DMA_ATTR_SKIP_CPU_SYNC);
@@ -511,7 +510,7 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 						    dma_addr_t addr,
 						    unsigned int len,
 						    u16 flags,
-						    bool indirect,
+						    bool indirect, dma_addr_t iova_head,
 								u32 iova_size, bool free_iova)
 {
 	struct vring_virtqueue *vring = to_vvq(vq);
@@ -531,6 +530,7 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 		extra[i].flags = flags;
 
 		// Fast and Safe IO
+		extra[i].iova_head = iova_head;
 		extra[i].iova_size = iova_size;
 		extra[i].free_iova = free_iova;
 	} else
@@ -623,7 +623,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			 */
 			i = virtqueue_add_desc_split(_vq, desc, i, addr, sg->length,
 						     VRING_DESC_F_NEXT,
-						     indirect, 0, false);
+						     indirect, 0, 0, false);
 		}
 	}
 	for (; n < (out_sgs + in_sgs); n++) {
@@ -648,7 +648,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 						     sg->length,
 						     VRING_DESC_F_NEXT |
 						     VRING_DESC_F_WRITE,
-						     indirect,
+						     indirect ? 0 : iova_base,
 								 indirect ? 0 : iova_size,
 								 indirect ? false : free_iova);
 		}
@@ -671,7 +671,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 					 head, addr,
 					 total_sg * sizeof(struct vring_desc),
 					 VRING_DESC_F_INDIRECT,
-					 false, 0, false);
+					 false, 0, 0, false);
 	}
 
 	/* We're using some buffers from the free list. */
