@@ -648,6 +648,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 						     sg->length,
 						     VRING_DESC_F_NEXT |
 						     VRING_DESC_F_WRITE,
+								 indirect,
 						     indirect ? 0 : iova_base,
 								 indirect ? 0 : iova_size,
 								 indirect ? false : free_iova);
