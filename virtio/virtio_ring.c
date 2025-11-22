@@ -466,7 +466,7 @@ static unsigned int vring_unmap_one_split(const struct vring_virtqueue *vq,
         	printk(KERN_ERR "VIRTIO-FNS: Unaligned Batch Head! Addr: %llx\n", batch_start_addr);
 				}
 				if (extra[i].iova_size != 64 * 4096) {
-						printk(KERN_ERR "VIRTIO-FNS: Weird Batch Size! Size: %u\n", extra[i].batch_size);
+						printk(KERN_ERR "VIRTIO-FNS: Weird Batch Size! Size: %u\n", extra[i].iova_size);
 				}
 
 				// Fast and Safe IO
