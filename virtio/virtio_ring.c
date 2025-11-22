@@ -443,6 +443,7 @@ static unsigned int vring_unmap_one_split(const struct vring_virtqueue *vq,
 					  unsigned int i)
 {
 	struct vring_desc_extra *extra = vq->split.desc_extra;
+	dma_addr_t unmap_addr = extra[i].addr;
 	u16 flags;
 
 	if (!vq->use_dma_api)
@@ -460,8 +461,9 @@ static unsigned int vring_unmap_one_split(const struct vring_virtqueue *vq,
 		if (extra[i].iova_size) {
 			if(extra[i].free_iova) {
 				// Fast and Safe IO
+				unmap_addr = extra[i].addr - (extra[i].iova_size - PAGE_SIZE);
 				iommu_dma_unmap_page_iova(vring_dma_dev(vq),
-							  extra[i].addr, extra[i].len,
+							  unmap_addr, extra[i].len,
 							  extra[i].iova_size, true,
 							  (flags & VRING_DESC_F_WRITE) ? DMA_FROM_DEVICE : DMA_TO_DEVICE,
 							  DMA_ATTR_SKIP_CPU_SYNC);
